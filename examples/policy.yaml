@@ -1,0 +1,11 @@
+sensitiveHostPaths:
+  - /proc
+  - /sys
+  - /dev
+  - /etc
+  - /root
+  - /var/lib/kubelet
+
+dockerSocketPaths:
+  - /var/run/docker.sock
+  - /run/docker.sock
