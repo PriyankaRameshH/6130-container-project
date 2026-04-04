@@ -165,15 +165,65 @@ run_attack3() {
     sleep 2
 }
 
+# ══════════════════════════════════════════════════════════════════
+# ATTACK 4 — Sensitive Host Filesystem Access
+# ══════════════════════════════════════════════════════════════════
+run_attack4() {
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    step "ATTACK 4 — Sensitive Host Filesystem Access (real container)"
+    echo -e "  Container: ubuntu with host / mounted read-only at /hostfs"
+    echo -e "  Technique: Read credentials, SSH keys, secrets from host FS"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+
+    docker rm -f attack4_sensitive_fs 2>/dev/null || true
+    docker run --rm --name attack4_sensitive_fs \
+        --pid=host \
+        -v /:/hostfs:ro \
+        -v "${SCRIPT_DIR}/attack4_sensitive_fs_access.sh:/attack.sh:ro" \
+        ubuntu:22.04 \
+        bash /attack.sh \
+        2>&1 | sed 's/^/    /'
+
+    echo ""
+    sleep 2
+}
+
+# ══════════════════════════════════════════════════════════════════
+# ATTACK 5 — Namespace Escape Attack
+# ══════════════════════════════════════════════════════════════════
+run_attack5() {
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    step "ATTACK 5 — Namespace Escape Attack (real container)"
+    echo -e "  Container: ubuntu --privileged --pid=host"
+    echo -e "  Technique: setns() to migrate into host mount/net/pid/uts/ipc NS"
+    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+
+    docker rm -f attack5_namespace 2>/dev/null || true
+    docker run --rm --name attack5_namespace \
+        --privileged \
+        --pid=host \
+        -v "${SCRIPT_DIR}/attack5_namespace_escape.sh:/attack.sh:ro" \
+        ubuntu:22.04 \
+        bash -c "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq util-linux iproute2 >/dev/null 2>&1 && bash /attack.sh" \
+        2>&1 | sed 's/^/    /'
+
+    echo ""
+    sleep 2
+}
+
 # ── Run selected attacks ─────────────────────────────────────────
 case "$ATTACK_NUM" in
     1) run_attack1 ;;
     2) run_attack2 ;;
     3) run_attack3 ;;
+    4) run_attack4 ;;
+    5) run_attack5 ;;
     all)
         run_attack1
         run_attack2
         run_attack3
+        run_attack4
+        run_attack5
         ;;
     *)
         fail "Unknown attack number: $ATTACK_NUM (use 1, 2, 3, or all)"

@@ -51,6 +51,12 @@ real-attack2: all
 real-attack3: all
 	sudo bash attacks/run_real_attacks.sh --attack 3
 
+real-attack4: all
+	sudo bash attacks/run_real_attacks.sh --attack 4
+
+real-attack5: all
+	sudo bash attacks/run_real_attacks.sh --attack 5
+
 clean:
 	rm -rf bin
 	rm -f $(BPF_OBJ)
