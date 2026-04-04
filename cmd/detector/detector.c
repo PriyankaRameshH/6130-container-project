@@ -54,6 +54,42 @@ struct metadata {
 static volatile sig_atomic_t stop = 0;
 static bool json_output = false;
 
+/* Cache: map cgroup_id → containerized metadata for short-lived processes */
+#define CGID_CACHE_SIZE 4096
+struct cgid_cache_entry {
+    uint64_t cgroup_id;
+    struct metadata meta;
+};
+static struct cgid_cache_entry cgid_cache[CGID_CACHE_SIZE];
+static size_t cgid_cache_len = 0;
+
+static void cgid_cache_put(uint64_t cgid, const struct metadata *meta)
+{
+    size_t i;
+    for (i = 0; i < cgid_cache_len; i++) {
+        if (cgid_cache[i].cgroup_id == cgid) {
+            cgid_cache[i].meta = *meta;
+            return;
+        }
+    }
+    if (cgid_cache_len < CGID_CACHE_SIZE) {
+        cgid_cache[cgid_cache_len].cgroup_id = cgid;
+        cgid_cache[cgid_cache_len].meta = *meta;
+        cgid_cache_len++;
+    }
+}
+
+static const struct metadata *cgid_cache_get(uint64_t cgid)
+{
+    size_t i;
+    for (i = 0; i < cgid_cache_len; i++) {
+        if (cgid_cache[i].cgroup_id == cgid) {
+            return &cgid_cache[i].meta;
+        }
+    }
+    return NULL;
+}
+
 static const char *default_sensitive_paths[] = {"/proc", "/sys", "/dev", "/etc", "/root", "/var/lib/kubelet"};
 static const size_t default_sensitive_paths_len = sizeof(default_sensitive_paths) / sizeof(default_sensitive_paths[0]);
 
@@ -517,6 +553,42 @@ static void print_alert(const struct event *ev,
            message);
 }
 
+static uint32_t host_mntns = 0;
+
+static uint32_t get_host_mntns(void)
+{
+    char link[PATH_MAX];
+    ssize_t n;
+    unsigned int ino = 0;
+
+    n = readlink("/proc/1/ns/mnt", link, sizeof(link) - 1);
+    if (n > 0) {
+        link[n] = '\0';
+        sscanf(link, "mnt:[%u]", &ino);
+    }
+    return ino;
+}
+
+static bool is_containerized_by_mntns(uint32_t pid)
+{
+    char ns_path[PATH_MAX];
+    char link[PATH_MAX];
+    ssize_t n;
+    unsigned int ino = 0;
+
+    if (host_mntns == 0) {
+        return false;
+    }
+
+    snprintf(ns_path, sizeof(ns_path), "/proc/%u/ns/mnt", pid);
+    n = readlink(ns_path, link, sizeof(link) - 1);
+    if (n > 0) {
+        link[n] = '\0';
+        sscanf(link, "mnt:[%u]", &ino);
+    }
+    return ino != 0 && ino != host_mntns;
+}
+
 static void evaluate_event(const struct event *ev)
 {
     struct metadata meta;
@@ -527,7 +599,30 @@ static void evaluate_event(const struct event *ev)
         path = "";
     }
 
-    meta = enrich_metadata(ev->pid);
+    /* Use tgid (actual PID) for proc lookups */
+    meta = enrich_metadata(ev->tgid);
+
+    /* Fallback: if cgroup check failed, try mntns comparison */
+    if (!meta.containerized) {
+        meta.containerized = is_containerized_by_mntns(ev->tgid);
+        if (meta.containerized) {
+            snprintf(meta.runtime, sizeof(meta.runtime), "docker");
+        }
+    }
+
+    /* Cache successful container detection by cgroup_id */
+    if (meta.containerized && ev->cgroup_id != 0) {
+        cgid_cache_put(ev->cgroup_id, &meta);
+    }
+
+    /* Final fallback: lookup cgroup_id cache for short-lived processes */
+    if (!meta.containerized && ev->cgroup_id != 0) {
+        const struct metadata *cached = cgid_cache_get(ev->cgroup_id);
+        if (cached) {
+            meta = *cached;
+        }
+    }
+
     if (!meta.containerized) {
         return;
     }
@@ -656,6 +751,12 @@ int main(int argc, char **argv)
         policy_free_owned(&runtime_policy);
         return 1;
     }
+
+    /* Ensure alerts are flushed immediately even when piped */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Cache host mount namespace for container detection fallback */
+    host_mntns = get_host_mntns();
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);

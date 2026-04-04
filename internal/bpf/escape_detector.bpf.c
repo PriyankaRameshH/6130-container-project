@@ -126,7 +126,6 @@ SEC("tracepoint/syscalls/sys_enter_connect")
 int trace_enter_connect(struct trace_event_raw_sys_enter *ctx)
 {
     struct event *e;
-    struct sockaddr_un saun = {};
     __u16 family = 0;
 
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -141,8 +140,9 @@ int trace_enter_connect(struct trace_event_raw_sys_enter *ctx)
     e->family = family;
 
     if (family == AF_UNIX) {
-        bpf_probe_read_user(&saun, sizeof(saun), (const void *)ctx->args[1]);
-        __builtin_memcpy(e->path, saun.sun_path, sizeof(e->path));
+        /* Read sun_path directly from userspace sockaddr_un (offset 2 = after sun_family) */
+        const void *sun_path_ptr = (const void *)(ctx->args[1] + 2);
+        bpf_probe_read_user_str(e->path, sizeof(e->path), sun_path_ptr);
     }
 
     bpf_ringbuf_submit(e, 0);
