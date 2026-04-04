@@ -6,6 +6,8 @@ BPF_C := internal/bpf/escape_detector.bpf.c
 BPF_OBJ := internal/bpf/escape_detector.bpf.o
 APP_C := cmd/detector/detector.c
 BIN := bin/detector
+SIM_C := scripts/simulate_attack.c
+SIM_BIN := bin/simulate_attack
 
 BPF_CFLAGS := -O2 -g -Wall -Werror -target bpf -I/usr/include/$(shell uname -m)-linux-gnu
 APP_CFLAGS := -O2 -g -Wall -Wextra
@@ -22,9 +24,16 @@ bpf:
 build:
 	mkdir -p bin
 	$(CC) $(APP_CFLAGS) $(APP_C) -o $(BIN) $(APP_LDFLAGS)
+	$(CC) $(APP_CFLAGS) $(SIM_C) -o $(SIM_BIN)
 
 run: all
 	sudo ./$(BIN) -policy examples/policy.yaml
+
+demo: all
+	sudo bash scripts/run_demo.sh
+
+demo-json: all
+	sudo bash scripts/run_demo.sh --json
 
 clean:
 	rm -rf bin
