@@ -35,6 +35,22 @@ demo: all
 demo-json: all
 	sudo bash scripts/run_demo.sh --json
 
+# Real container escape attack demos
+real-attack: all
+	sudo bash attacks/run_real_attacks.sh
+
+real-attack-json: all
+	sudo bash attacks/run_real_attacks.sh --json
+
+real-attack1: all
+	sudo bash attacks/run_real_attacks.sh --attack 1
+
+real-attack2: all
+	sudo bash attacks/run_real_attacks.sh --attack 2
+
+real-attack3: all
+	sudo bash attacks/run_real_attacks.sh --attack 3
+
 clean:
 	rm -rf bin
 	rm -f $(BPF_OBJ)
