@@ -567,11 +567,11 @@ static void evaluate_event(const struct event *ev)
     if (is_noise_comm(ev->comm))
         return;
 
-    /* ── Step 4: Run each attack detector ── */
-    detect_docker_socket_escape(ev, &meta);
-    detect_privileged_escape(ev, &meta);
-    detect_cgroup_escape(ev, &meta);
-    detect_sensitive_fs_access(ev, &meta);
+    /* ── Step 4: Run attack detectors (exclusive — first match wins) ── */
+    if (detect_docker_socket_escape(ev, &meta)) return;
+    if (detect_privileged_escape(ev, &meta))     return;
+    if (detect_cgroup_escape(ev, &meta))         return;
+    if (detect_sensitive_fs_access(ev, &meta))   return;
     detect_namespace_escape(ev, &meta);
 }
 

