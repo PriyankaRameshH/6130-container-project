@@ -51,6 +51,23 @@ struct {
     __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
+/* Map to store the detector's own PID so we can skip our own events */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} detector_pid SEC(".maps");
+
+static __always_inline int is_self(void)
+{
+    __u32 key = 0;
+    __u32 *pid = bpf_map_lookup_elem(&detector_pid, &key);
+    if (pid && *pid == (bpf_get_current_pid_tgid() >> 32))
+        return 1;
+    return 0;
+}
+
 static __always_inline void fill_common(struct event *e, __u32 event_type)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -71,6 +88,9 @@ int trace_enter_mount(struct trace_event_raw_sys_enter *ctx)
 {
     struct event *e;
 
+    if (is_self())
+        return 0;
+
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         return 0;
@@ -90,6 +110,9 @@ int trace_enter_setns(struct trace_event_raw_sys_enter *ctx)
 {
     struct event *e;
 
+    if (is_self())
+        return 0;
+
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         return 0;
@@ -107,6 +130,9 @@ SEC("tracepoint/syscalls/sys_enter_openat")
 int trace_enter_openat(struct trace_event_raw_sys_enter *ctx)
 {
     struct event *e;
+
+    if (is_self())
+        return 0;
 
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
@@ -128,6 +154,9 @@ int trace_enter_connect(struct trace_event_raw_sys_enter *ctx)
     struct event *e;
     __u16 family = 0;
 
+    if (is_self())
+        return 0;
+
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         return 0;
@@ -135,6 +164,10 @@ int trace_enter_connect(struct trace_event_raw_sys_enter *ctx)
 
     fill_common(e, EVT_CONNECT);
     e->fd = (__s32)ctx->args[0];
+
+    /* Zero path/extra so non-AF_UNIX events don't carry garbage */
+    __builtin_memset(e->path, 0, sizeof(e->path));
+    __builtin_memset(e->extra, 0, sizeof(e->extra));
 
     bpf_probe_read_user(&family, sizeof(family), (const void *)ctx->args[1]);
     e->family = family;

@@ -70,7 +70,7 @@ docker run --rm -it \
 ### Expected Detector Alerts
 
 - `docker-socket-connect` (CRITICAL) — connect() to `/var/run/docker.sock`
-- `sensitive-host-path-open` (HIGH) — openat() on Docker socket
+- `sensitive-host-path-open` (CRITICAL) — openat() on Docker socket
 
 ---
 
@@ -102,16 +102,16 @@ docker run --rm -it \
 
 ### Expected Detector Alerts
 
-- `privileged-container-escape` (HIGH) — mount() syscalls
-- `sensitive-host-path-open` (HIGH) — openat() on `/proc/1/root`, `/sys/fs/cgroup`
+- `privileged-container-escape` (CRITICAL) — mount() and setns() syscalls
+- `sensitive-host-path-open` (HIGH) — openat() on `/proc/1/root`, `/sys`, `/dev`
 
 ---
 
 ## Attack 3 — Kernel Exploit Simulation (CVE-2022-0492)
 
-**Category:** Kernel Exploit Simulation  
+**Category:** Cgroup Release Agent Escape  
 **Risk:** CRITICAL  
-**Technique:** Exploit the cgroup v1 `release_agent` mechanism to execute arbitrary commands on the host. This is a simulation of CVE-2022-0492.
+**Technique:** Exploit the cgroup v1 `release_agent` mechanism to execute arbitrary commands on the host as root. This is a simulation of CVE-2022-0492.
 
 ### Docker Command
 
@@ -135,8 +135,8 @@ docker run --rm -it \
 
 ### Expected Detector Alerts
 
-- `privileged-container-escape` (HIGH) — mount(cgroup) syscalls
-- `sensitive-host-path-open` (MEDIUM) — openat() on `/sys/fs/cgroup`, `/proc/self/cgroup`
+- `privileged-container-escape` (CRITICAL) — mount(cgroup) syscalls
+- `sensitive-host-path-open` (HIGH) — openat() on `/sys/fs/cgroup`, `/proc/self/cgroup`
 
 ---
 
@@ -245,8 +245,8 @@ make real-attack5    # Namespace Escape only
 | # | Attack | Docker Flags | Escape Result | Detector Alert Level |
 |---|--------|-------------|---------------|---------------------|
 | 1 | Docker Socket Escape | `-v /var/run/docker.sock:/var/run/docker.sock` | ESCAPED | CRITICAL |
-| 2 | Privileged Container Escape | `--privileged --pid=host` | ESCAPED | HIGH/CRITICAL |
-| 3 | Kernel Exploit (CVE-2022-0492) | `--privileged` | BLOCKED (cgroupv2) | HIGH |
+| 2 | Privileged Container Escape | `--privileged --pid=host` | ESCAPED | CRITICAL |
+| 3 | Kernel Exploit (CVE-2022-0492) | `--privileged` | BLOCKED (cgroupv2) | CRITICAL |
 | 4 | Sensitive Host FS Access | `-v /:/hostfs:ro --pid=host` | EXFILTRATED | HIGH/MEDIUM |
 | 5 | Namespace Escape | `--privileged --pid=host` | ESCAPED | CRITICAL |
 
