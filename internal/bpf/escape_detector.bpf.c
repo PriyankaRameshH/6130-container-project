@@ -5,6 +5,13 @@
 #include <linux/un.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+/* Minimal CO-RE stubs for reading mntns from task_struct */
+struct ns_common { unsigned int inum; } __attribute__((preserve_access_index));
+struct mnt_namespace { struct ns_common ns; } __attribute__((preserve_access_index));
+struct nsproxy { struct mnt_namespace *mnt_ns; } __attribute__((preserve_access_index));
+struct task_struct { struct nsproxy *nsproxy; } __attribute__((preserve_access_index));
 
 #define TASK_COMM_LEN 16
 #define PATH_LEN 128
@@ -81,6 +88,10 @@ static __always_inline void fill_common(struct event *e, __u32 event_type)
     e->event_type = event_type;
     e->cgroup_id = bpf_get_current_cgroup_id();
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    /* Read mntns inum directly from task_struct via CO-RE */
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    e->mntns = BPF_CORE_READ(task, nsproxy, mnt_ns, ns.inum);
 }
 
 SEC("tracepoint/syscalls/sys_enter_mount")

@@ -287,6 +287,7 @@ static void print_alert(const struct event *ev, const struct metadata *meta,
                event_name(ev->event_type), ev->tgid, ev->comm,
                ev->path, meta->container_id, message);
     }
+    fflush(stdout);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -535,15 +536,28 @@ static void evaluate_event(const struct event *ev)
 
     if (!p) p = "";
 
-    /* ── Step 1: Enrich with container metadata ── */
+    /* ── Step 1: Quick mntns check from BPF data (no /proc needed) ──
+     * If the event's mntns differs from the host, it's a container.
+     * This avoids the race where short-lived processes exit before
+     * we can read /proc/<pid>/cgroup.
+     */
+    bool is_container_by_mntns = (host_mntns != 0 && ev->mntns != 0 &&
+                                   ev->mntns != host_mntns);
+
+    /* ── Step 2: Enrich with container metadata ── */
     meta = enrich_metadata(ev->tgid);
 
-    /* ── Step 2: STRICT container check ──
-     * A process MUST meet ALL of these to be considered a real container:
-     *   - detected as containerized (cgroup or mntns)
-     *   - has a real container_id (not empty)
-     *   - NOT a known host system process
-     */
+    /* If /proc-based detection failed but BPF mntns says container,
+     * trust the BPF data (it was captured at syscall time). */
+    if (!meta.containerized && is_container_by_mntns) {
+        meta.containerized = true;
+        if (meta.container_id[0] == '\0')
+            snprintf(meta.container_id, sizeof(meta.container_id), "unknown");
+        if (meta.runtime[0] == '\0')
+            snprintf(meta.runtime, sizeof(meta.runtime), "docker");
+    }
+
+    /* ── Step 3: STRICT container check ── */
     if (!meta.containerized)
         return;
 
@@ -553,10 +567,7 @@ static void evaluate_event(const struct event *ev)
     if (is_noise_comm(ev->comm))
         return;
 
-    /* ── Step 3: Run each attack detector ──
-     * Each function returns true if it matched, but we run ALL
-     * of them so overlapping attacks are all reported.
-     */
+    /* ── Step 4: Run each attack detector ── */
     detect_docker_socket_escape(ev, &meta);
     detect_privileged_escape(ev, &meta);
     detect_cgroup_escape(ev, &meta);
@@ -625,7 +636,8 @@ int main(int argc, char **argv)
         }
     }
 
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     host_mntns = get_host_mntns();
     self_tgid = (uint32_t)getpid();
 
