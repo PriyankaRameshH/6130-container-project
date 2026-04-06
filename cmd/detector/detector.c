@@ -40,6 +40,7 @@ struct event {
     uint32_t flags;
     uint32_t family;
     uint64_t cgroup_id;
+    uint64_t cap_eff;
     char comm[TASK_COMM_LEN];
     char path[PATH_LEN];
     char extra[PATH_LEN];
@@ -158,26 +159,6 @@ static const char *severity_str(int s)
 }
 
 /* ── Metadata enrichment ───────────────────────────────────────── */
-static bool has_cap_sys_admin(uint32_t pid)
-{
-    char path[PATH_MAX];
-    FILE *f;
-    char line[512];
-
-    snprintf(path, sizeof(path), "/proc/%u/status", pid);
-    f = fopen(path, "r");
-    if (!f) return false;
-
-    while (fgets(line, sizeof(line), f)) {
-        unsigned long long cap;
-        if (strncmp(line, "CapEff:", 7) == 0 && sscanf(line + 7, "%llx", &cap) == 1) {
-            fclose(f);
-            return (cap & (1ULL << CAP_SYS_ADMIN_BIT)) != 0;
-        }
-    }
-    fclose(f);
-    return false;
-}
 
 static uint32_t get_host_mntns(void)
 {
@@ -209,7 +190,7 @@ static bool is_containerized_by_mntns(uint32_t pid)
     return ino != 0 && ino != host_mntns;
 }
 
-static struct metadata enrich_metadata(uint32_t pid)
+static struct metadata enrich_metadata(uint32_t pid, const struct event *ev)
 {
     struct metadata meta = {0};
     char path[PATH_MAX];
@@ -255,7 +236,7 @@ static struct metadata enrich_metadata(uint32_t pid)
     if (meta.containerized && meta.container_id[0] == '\0')
         snprintf(meta.container_id, sizeof(meta.container_id), "unknown");
 
-    meta.cap_sys_admin = has_cap_sys_admin(pid);
+    meta.cap_sys_admin = (ev->cap_eff & (1ULL << CAP_SYS_ADMIN_BIT)) != 0;
     return meta;
 }
 
@@ -417,16 +398,6 @@ static bool detect_cgroup_escape(const struct event *ev,
  *  Triggers: openat() on specific high-value host files that have
  *  been bind-mounted into the container (e.g., /etc/shadow)
  * ═════════════════════════════════════════════════════════════════ */
-static const char *sensitive_credential_files[] = {
-    "/etc/shadow", "/etc/gshadow", "/etc/sudoers",
-    "/root/.ssh/id_rsa", "/root/.ssh/id_ed25519",
-    "/root/.ssh/id_ecdsa", "/root/.ssh/authorized_keys",
-    "/etc/docker/daemon.json", "/root/.docker/config.json",
-    "/var/lib/kubelet/config.yaml", "/etc/kubernetes/admin.conf",
-    "/etc/kubernetes/pki",
-    NULL,
-};
-
 static const char *sensitive_host_prefixes[] = {
     "/hostfs/etc/shadow", "/hostfs/etc/gshadow", "/hostfs/etc/sudoers",
     "/hostfs/etc/passwd",
@@ -443,16 +414,6 @@ static bool detect_sensitive_fs_access(const struct event *ev,
 
     if (ev->event_type != EVT_OPENAT)
         return false;
-
-    /* Check exact credential file paths */
-    for (int i = 0; sensitive_credential_files[i]; i++) {
-        if (strcmp(p, sensitive_credential_files[i]) == 0) {
-            print_alert(ev, meta, 3, "SENSITIVE-FS-ACCESS",
-                        "credential-file-read",
-                        "Container read sensitive credential file from host");
-            return true;
-        }
-    }
 
     /* Check /hostfs/ paths — container reading mounted host filesystem */
     for (int i = 0; sensitive_host_prefixes[i]; i++) {
@@ -545,7 +506,7 @@ static void evaluate_event(const struct event *ev)
                                    ev->mntns != host_mntns);
 
     /* ── Step 2: Enrich with container metadata ── */
-    meta = enrich_metadata(ev->tgid);
+    meta = enrich_metadata(ev->tgid, ev);
 
     /* If /proc-based detection failed but BPF mntns says container,
      * trust the BPF data (it was captured at syscall time). */
@@ -567,12 +528,14 @@ static void evaluate_event(const struct event *ev)
     if (is_noise_comm(ev->comm))
         return;
 
-    /* ── Step 4: Run attack detectors (exclusive — first match wins) ── */
+    /* ── Step 4: Run attack detectors (exclusive — first match wins) ──
+     * Order matters: specific detectors run before general ones so
+     * cgroup/namespace attacks aren't swallowed by privileged-escape. */
     if (detect_docker_socket_escape(ev, &meta)) return;
-    if (detect_privileged_escape(ev, &meta))     return;
     if (detect_cgroup_escape(ev, &meta))         return;
-    if (detect_sensitive_fs_access(ev, &meta))   return;
-    detect_namespace_escape(ev, &meta);
+    if (detect_namespace_escape(ev, &meta))      return;
+    if (detect_privileged_escape(ev, &meta))     return;
+    detect_sensitive_fs_access(ev, &meta);
 }
 
 /* ── Ring buffer callback ──────────────────────────────────────── */

