@@ -605,6 +605,25 @@ static bool evaluate_rule(const struct rule *r, const struct event *ev,
 
 /* ── Defense actions ──────────────────────────────────────────── */
 
+/* Killed-container cache: skip redundant docker kill calls */
+#define KILL_CACHE_SIZE 64
+static char kill_cache[KILL_CACHE_SIZE][13];   /* 12-char short IDs + NUL */
+static int  kill_cache_count = 0;
+
+static bool already_killed(const char *cid)
+{
+    for (int i = 0; i < kill_cache_count; i++)
+        if (strncmp(kill_cache[i], cid, 12) == 0)
+            return true;
+    return false;
+}
+
+static void mark_killed(const char *cid)
+{
+    if (kill_cache_count >= KILL_CACHE_SIZE) return;
+    snprintf(kill_cache[kill_cache_count++], 13, "%.12s", cid);
+}
+
 static const char *response_label(enum response_type r) __attribute__((unused));
 static const char *response_label(enum response_type r)
 {
@@ -623,6 +642,11 @@ static void execute_response(enum response_type resp, const struct event *ev,
     case RESP_KILL_CONTAINER:
         if (meta->container_id[0] != '\0' &&
             strcmp(meta->container_id, "unknown") != 0) {
+            if (already_killed(meta->container_id)) {
+                fprintf(stderr, "  [DEFENSE] Container %.12s already killed — skipping\n",
+                        meta->container_id);
+                break;
+            }
             char cmd[256];
             snprintf(cmd, sizeof(cmd), "docker kill %.12s >/dev/null 2>&1",
                      meta->container_id);
@@ -631,8 +655,8 @@ static void execute_response(enum response_type resp, const struct event *ev,
             int ret = system(cmd);
             if (ret != 0)
                 fprintf(stderr, "  [DEFENSE] docker kill returned %d\n", ret);
+            mark_killed(meta->container_id);
         } else {
-            /* Fallback: kill the process tree */
             fprintf(stderr, "  [DEFENSE] Container unknown — killing pid %u\n",
                     ev->tgid);
             kill((pid_t)ev->tgid, SIGKILL);
