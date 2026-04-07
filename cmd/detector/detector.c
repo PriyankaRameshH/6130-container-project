@@ -394,6 +394,12 @@ enum match_type {
     MATCH_CONTAINS,
 };
 
+enum response_type {
+    RESP_LOG_WARN = 0,
+    RESP_KILL_PROCESS,
+    RESP_KILL_CONTAINER,
+};
+
 struct rule {
     char     name[64];
     char     attack[64];
@@ -407,6 +413,7 @@ struct rule {
     uint32_t family;
     bool     requires_cap;
     int      severity;
+    enum response_type response;
     char     message[256];
 };
 
@@ -525,7 +532,14 @@ static int load_policy(const char *path)
             r->also_match_extra = (strcmp(val, "true") == 0);
         else if (strcmp(key, "severity") == 0)
             r->severity = parse_severity(val);
-        else if (strcmp(key, "message") == 0)
+        else if (strcmp(key, "response") == 0) {
+            if (strcmp(val, "kill-container") == 0)
+                r->response = RESP_KILL_CONTAINER;
+            else if (strcmp(val, "kill-process") == 0)
+                r->response = RESP_KILL_PROCESS;
+            else
+                r->response = RESP_LOG_WARN;
+        } else if (strcmp(key, "message") == 0)
             snprintf(r->message, sizeof(r->message), "%s", val);
         else if (strcmp(key, "paths") == 0)
             list_ctx = CTX_PATHS;
@@ -589,6 +603,53 @@ static bool evaluate_rule(const struct rule *r, const struct event *ev,
     return true;
 }
 
+/* ── Defense actions ──────────────────────────────────────────── */
+
+static const char *response_label(enum response_type r) __attribute__((unused));
+static const char *response_label(enum response_type r)
+{
+    switch (r) {
+    case RESP_KILL_CONTAINER: return "KILL-CONTAINER";
+    case RESP_KILL_PROCESS:   return "KILL-PROCESS";
+    case RESP_LOG_WARN:       return "LOG-WARN";
+    default:                  return "LOG-WARN";
+    }
+}
+
+static void execute_response(enum response_type resp, const struct event *ev,
+                             const struct metadata *meta)
+{
+    switch (resp) {
+    case RESP_KILL_CONTAINER:
+        if (meta->container_id[0] != '\0' &&
+            strcmp(meta->container_id, "unknown") != 0) {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "docker kill %.12s >/dev/null 2>&1",
+                     meta->container_id);
+            fprintf(stderr, "  [DEFENSE] Killing container %.12s (pid %u)\n",
+                    meta->container_id, ev->tgid);
+            int ret = system(cmd);
+            if (ret != 0)
+                fprintf(stderr, "  [DEFENSE] docker kill returned %d\n", ret);
+        } else {
+            /* Fallback: kill the process tree */
+            fprintf(stderr, "  [DEFENSE] Container unknown — killing pid %u\n",
+                    ev->tgid);
+            kill((pid_t)ev->tgid, SIGKILL);
+        }
+        break;
+    case RESP_KILL_PROCESS:
+        fprintf(stderr, "  [DEFENSE] Killing process %u (%s)\n",
+                ev->tgid, ev->comm);
+        kill((pid_t)ev->tgid, SIGKILL);
+        break;
+    case RESP_LOG_WARN:
+        fprintf(stderr, "  [DEFENSE] WARNING — suspicious activity logged (pid %u)\n",
+                ev->tgid);
+        break;
+    }
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  Main event evaluator — runs policy rules in order
  * ═════════════════════════════════════════════════════════════════ */
@@ -611,6 +672,7 @@ static void evaluate_event(const struct event *ev)
             print_alert(ev, &meta, policy_rules[i].severity,
                        policy_rules[i].attack, policy_rules[i].name,
                        policy_rules[i].message);
+            execute_response(policy_rules[i].response, ev, &meta);
             return;
         }
     }

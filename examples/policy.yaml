@@ -14,6 +14,7 @@
 #   requires_cap_sys_admin: Only match if process has CAP_SYS_ADMIN
 #   exclude_comm:           Skip if process name starts with any entry
 #   severity:               CRITICAL | HIGH | MEDIUM | LOW
+#   response:               kill-container | kill-process | log-warn
 #   message:                Human-readable alert text
 
 rules:
@@ -28,6 +29,7 @@ rules:
       - /var/run/docker.sock
       - /run/docker.sock
     severity: CRITICAL
+    response: kill-container
     message: Container process connected to Docker socket
 
   - rule: docker-socket-open
@@ -38,6 +40,7 @@ rules:
       - /var/run/docker.sock
       - /run/docker.sock
     severity: CRITICAL
+    response: kill-container
     message: Container process opened Docker socket
 
   # ── Attack 3: Cgroup Escape (before privileged — more specific) ─
@@ -51,6 +54,7 @@ rules:
       - cgroup2
     also_match_extra: true
     severity: CRITICAL
+    response: kill-process
     message: Container mounted cgroup filesystem (CVE-2022-0492)
 
   - rule: cgroup-release-agent
@@ -61,6 +65,7 @@ rules:
       - release_agent
       - notify_on_release
     severity: CRITICAL
+    response: kill-process
     message: Container accessed cgroup release_agent/notify_on_release
 
   # ── Attack 5: Namespace Escape (before privileged — more specific) ─
@@ -73,6 +78,7 @@ rules:
       - "runc:["
       - containerd-shi
     severity: CRITICAL
+    response: kill-container
     message: Container process called setns() to join host namespace
 
   - rule: namespace-probe
@@ -83,6 +89,7 @@ rules:
       - /proc/1/ns/
       - /proc/self/ns/
     severity: HIGH
+    response: kill-container
     message: Container opened host namespace file
 
   # ── Attack 2: Privileged Escape (catch-all after specific) ──
@@ -95,6 +102,7 @@ rules:
       - runc
       - "runc:["
     severity: CRITICAL
+    response: kill-container
     message: Privileged container invoked mount()
 
   - rule: container-setns
@@ -105,6 +113,7 @@ rules:
       - runc
       - "runc:["
     severity: CRITICAL
+    response: kill-container
     message: Privileged container invoked setns()
 
   - rule: proc-root-access
@@ -114,6 +123,7 @@ rules:
     paths:
       - /proc/1/root
     severity: CRITICAL
+    response: kill-container
     message: Container accessed host via /proc/1/root
 
   # ── Attack 4: Sensitive FS Access ───────────────────────────
@@ -133,6 +143,7 @@ rules:
       - /hostfs/var/lib/kubelet
       - /hostfs/etc/kubernetes
     severity: HIGH
+    response: log-warn
     message: Container read host credential via bind mount
 
   - rule: host-environ-read
@@ -142,6 +153,7 @@ rules:
     paths:
       - /proc/1/environ
     severity: HIGH
+    response: log-warn
     message: Container read host PID 1 environment variables
 
   - rule: host-process-enum
@@ -151,4 +163,5 @@ rules:
     paths:
       - /proc/1/cmdline
     severity: MEDIUM
+    response: log-warn
     message: Container enumerating host process command lines
