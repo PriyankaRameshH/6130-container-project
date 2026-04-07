@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <dirent.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -58,6 +59,34 @@ static volatile sig_atomic_t stop = 0;
 static bool json_output = false;
 static uint32_t self_tgid = 0;
 static uint32_t host_mntns = 0;
+static uint64_t boot_time_ns = 0;   /* CLOCK_REALTIME - CLOCK_BOOTTIME at startup */
+
+/* ── Container ID cache (keyed by mntns) ─────────────────────── */
+#define ID_CACHE_SIZE 128
+struct id_cache_entry {
+    uint32_t mntns;
+    char     container_id[65];
+    char     runtime[24];
+};
+static struct id_cache_entry id_cache[ID_CACHE_SIZE];
+static int id_cache_count = 0;
+
+static struct id_cache_entry *cache_lookup(uint32_t mntns)
+{
+    for (int i = 0; i < id_cache_count; i++)
+        if (id_cache[i].mntns == mntns)
+            return &id_cache[i];
+    return NULL;
+}
+
+static void cache_store(uint32_t mntns, const char *cid, const char *runtime)
+{
+    if (id_cache_count >= ID_CACHE_SIZE) return;
+    struct id_cache_entry *e = &id_cache[id_cache_count++];
+    e->mntns = mntns;
+    snprintf(e->container_id, sizeof(e->container_id), "%s", cid);
+    snprintf(e->runtime, sizeof(e->runtime), "%s", runtime);
+}
 
 /* ── Noise filter: known host-side system processes to ignore ── */
 static const char *host_noise_comms[] = {
@@ -190,50 +219,127 @@ static bool is_containerized_by_mntns(uint32_t pid)
     return ino != 0 && ino != host_mntns;
 }
 
-static struct metadata enrich_metadata(uint32_t pid, const struct event *ev)
+/* Try to read cgroup for a single PID and extract container info */
+static bool try_read_cgroup(uint32_t pid, struct metadata *meta)
 {
-    struct metadata meta = {0};
-    char path[PATH_MAX];
+    char path_buf[PATH_MAX];
     FILE *f;
     char line[1024];
     char cgroup_blob[8192] = {0};
     size_t used = 0;
 
-    snprintf(path, sizeof(path), "/proc/%u/cgroup", pid);
-    f = fopen(path, "r");
-    if (f) {
-        while (fgets(line, sizeof(line), f)) {
-            size_t len = strlen(line);
-            trim_newline(line);
-            if (strstr(line, "docker") || strstr(line, "containerd") ||
-                strstr(line, "kubepods") || strstr(line, "crio") ||
-                strstr(line, "libpod")) {
-                meta.containerized = true;
-            }
-            if (used + len + 1 < sizeof(cgroup_blob)) {
-                memcpy(cgroup_blob + used, line, len);
-                used += len;
-                cgroup_blob[used++] = '\n';
-                cgroup_blob[used] = '\0';
-            }
-        }
-        fclose(f);
-        infer_runtime(cgroup_blob, meta.runtime, sizeof(meta.runtime));
-        extract_container_id(cgroup_blob, meta.container_id, sizeof(meta.container_id));
-    } else {
-        snprintf(meta.runtime, sizeof(meta.runtime), "unknown");
-    }
+    snprintf(path_buf, sizeof(path_buf), "/proc/%u/cgroup", pid);
+    f = fopen(path_buf, "r");
+    if (!f) return false;
 
-    /* mntns fallback — process may be dead before cgroup was read */
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        trim_newline(line);
+        if (strstr(line, "docker") || strstr(line, "containerd") ||
+            strstr(line, "kubepods") || strstr(line, "crio") ||
+            strstr(line, "libpod")) {
+            meta->containerized = true;
+        }
+        if (used + len + 1 < sizeof(cgroup_blob)) {
+            memcpy(cgroup_blob + used, line, len);
+            used += len;
+            cgroup_blob[used++] = '\n';
+            cgroup_blob[used] = '\0';
+        }
+    }
+    fclose(f);
+
+    infer_runtime(cgroup_blob, meta->runtime, sizeof(meta->runtime));
+    extract_container_id(cgroup_blob, meta->container_id, sizeof(meta->container_id));
+    return (meta->container_id[0] != '\0');
+}
+
+/* Scan /proc for any process sharing the same mntns to get container ID */
+static bool resolve_id_by_mntns(uint32_t target_mntns, struct metadata *meta)
+{
+    DIR *d;
+    struct dirent *ent;
+    char ns_path[PATH_MAX], link[PATH_MAX];
+    unsigned int ino;
+
+    if (target_mntns == 0 || target_mntns == host_mntns)
+        return false;
+
+    d = opendir("/proc");
+    if (!d) return false;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] < '1' || ent->d_name[0] > '9')
+            continue;
+        uint32_t p = (uint32_t)atoi(ent->d_name);
+        snprintf(ns_path, sizeof(ns_path), "/proc/%u/ns/mnt", p);
+        ssize_t n = readlink(ns_path, link, sizeof(link) - 1);
+        if (n <= 0) continue;
+        link[n] = '\0';
+        ino = 0;
+        sscanf(link, "mnt:[%u]", &ino);
+        if (ino != target_mntns) continue;
+
+        /* Found a process in the same mntns — try its cgroup */
+        if (try_read_cgroup(p, meta)) {
+            closedir(d);
+            return true;
+        }
+    }
+    closedir(d);
+    return false;
+}
+
+static struct metadata enrich_metadata(uint32_t pid, const struct event *ev)
+{
+    struct metadata meta = {0};
+
+    /* 1. Try direct cgroup read for this PID */
+    bool got_id = try_read_cgroup(pid, &meta);
+
+    /* 2. /proc mntns fallback — process may be dead before cgroup was read */
     if (!meta.containerized) {
         meta.containerized = is_containerized_by_mntns(pid);
-        if (meta.containerized)
+        if (meta.containerized && meta.runtime[0] == '\0')
             snprintf(meta.runtime, sizeof(meta.runtime), "docker");
     }
 
-    /* If containerized but container_id is empty (short-lived proc),
-     * set a placeholder so evaluate_event doesn't skip it. */
-    if (meta.containerized && meta.container_id[0] == '\0')
+    /* 3. BPF mntns fallback — even if /proc reads failed (process dead),
+     *    BPF captured the mntns at syscall time */
+    if (!meta.containerized && host_mntns != 0 && ev->mntns != 0 &&
+        ev->mntns != host_mntns) {
+        meta.containerized = true;
+        if (meta.runtime[0] == '\0')
+            snprintf(meta.runtime, sizeof(meta.runtime), "docker");
+    }
+
+    if (!meta.containerized) {
+        meta.cap_sys_admin = (ev->cap_eff & (1ULL << CAP_SYS_ADMIN_BIT)) != 0;
+        return meta;
+    }
+
+    /* 4. If containerized but no ID, check the mntns cache */
+    if (!got_id && ev->mntns != 0) {
+        struct id_cache_entry *cached = cache_lookup(ev->mntns);
+        if (cached) {
+            snprintf(meta.container_id, sizeof(meta.container_id), "%s", cached->container_id);
+            snprintf(meta.runtime, sizeof(meta.runtime), "%s", cached->runtime);
+            got_id = true;
+        }
+    }
+
+    /* 5. If still no ID, scan /proc for sibling with same mntns */
+    if (!got_id && ev->mntns != 0) {
+        got_id = resolve_id_by_mntns(ev->mntns, &meta);
+    }
+
+    /* 6. Cache the result for future events from this container */
+    if (got_id && ev->mntns != 0 && !cache_lookup(ev->mntns)) {
+        cache_store(ev->mntns, meta.container_id, meta.runtime);
+    }
+
+    /* 7. Last resort placeholder */
+    if (meta.container_id[0] == '\0')
         snprintf(meta.container_id, sizeof(meta.container_id), "unknown");
 
     meta.cap_sys_admin = (ev->cap_eff & (1ULL << CAP_SYS_ADMIN_BIT)) != 0;
@@ -245,7 +351,9 @@ static void print_alert(const struct event *ev, const struct metadata *meta,
                         int severity, const char *attack, const char *rule,
                         const char *message)
 {
-    time_t sec = (time_t)(ev->ts_ns / 1000000000ULL);
+    /* Convert BPF monotonic (boot) time to wall-clock time */
+    uint64_t real_ns = ev->ts_ns + boot_time_ns;
+    time_t sec = (time_t)(real_ns / 1000000000ULL);
     struct tm tm_buf;
     char ts[64] = {0};
 
@@ -487,22 +595,8 @@ static bool evaluate_rule(const struct rule *r, const struct event *ev,
 static void evaluate_event(const struct event *ev)
 {
     struct metadata meta;
-    const char *p = ev->path;
-
-    if (!p) p = "";
-
-    bool is_container_by_mntns = (host_mntns != 0 && ev->mntns != 0 &&
-                                   ev->mntns != host_mntns);
 
     meta = enrich_metadata(ev->tgid, ev);
-
-    if (!meta.containerized && is_container_by_mntns) {
-        meta.containerized = true;
-        if (meta.container_id[0] == '\0')
-            snprintf(meta.container_id, sizeof(meta.container_id), "unknown");
-        if (meta.runtime[0] == '\0')
-            snprintf(meta.runtime, sizeof(meta.runtime), "docker");
-    }
 
     if (!meta.containerized)
         return;
@@ -590,6 +684,15 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
     host_mntns = get_host_mntns();
     self_tgid = (uint32_t)getpid();
+
+    /* Compute monotonic-to-realtime offset for accurate timestamps */
+    {
+        struct timespec rt, bt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        clock_gettime(CLOCK_BOOTTIME, &bt);
+        boot_time_ns = ((uint64_t)rt.tv_sec * 1000000000ULL + (uint64_t)rt.tv_nsec)
+                     - ((uint64_t)bt.tv_sec * 1000000000ULL + (uint64_t)bt.tv_nsec);
+    }
 
     if (load_policy(policy_path) != 0 || policy_rule_count == 0) {
         fprintf(stderr, "no rules loaded — aborting\n");
