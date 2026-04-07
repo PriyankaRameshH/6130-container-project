@@ -29,7 +29,7 @@ rules:
       - /var/run/docker.sock
       - /run/docker.sock
     severity: CRITICAL
-    response: kill-container
+    response: kill-process
     message: Container process connected to Docker socket
 
   - rule: docker-socket-open
@@ -40,7 +40,7 @@ rules:
       - /var/run/docker.sock
       - /run/docker.sock
     severity: CRITICAL
-    response: kill-container
+    response: kill-process
     message: Container process opened Docker socket
 
   # ── Attack 3: Cgroup Escape (before privileged — more specific) ─
@@ -102,7 +102,7 @@ rules:
       - runc
       - "runc:["
     severity: CRITICAL
-    response: kill-container
+    response: kill-process
     message: Privileged container invoked mount()
 
   - rule: container-setns
@@ -113,7 +113,7 @@ rules:
       - runc
       - "runc:["
     severity: CRITICAL
-    response: kill-container
+    response: kill-process
     message: Privileged container invoked setns()
 
   - rule: proc-root-access
@@ -123,7 +123,7 @@ rules:
     paths:
       - /proc/1/root
     severity: CRITICAL
-    response: kill-container
+    response: kill-process
     message: Container accessed host via /proc/1/root
 
   # ── Attack 4: Sensitive FS Access ───────────────────────────
