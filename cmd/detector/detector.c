@@ -272,223 +272,217 @@ static void print_alert(const struct event *ev, const struct metadata *meta,
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  ATTACK 1 — Docker Socket Escape
- *
- *  Triggers: connect() or openat() on /var/run/docker.sock
- *  from a process INSIDE a container.
+ *  Rule-based detection engine (loaded from policy.yaml)
  * ═════════════════════════════════════════════════════════════════ */
-static bool detect_docker_socket_escape(const struct event *ev,
-                                        const struct metadata *meta)
-{
-    const char *p = ev->path;
 
-    if (ev->event_type == EVT_CONNECT && ev->family == 1 /* AF_UNIX */) {
-        if (strcmp(p, "/var/run/docker.sock") == 0 ||
-            strcmp(p, "/run/docker.sock") == 0) {
-            print_alert(ev, meta, 4, "DOCKER-SOCKET-ESCAPE",
-                        "docker-socket-connect",
-                        "Container process connected to Docker socket");
-            return true;
-        }
-    }
+#define MAX_RULES          64
+#define MAX_PATHS_PER_RULE 16
+#define MAX_EXCLUDES       8
 
-    if (ev->event_type == EVT_OPENAT) {
-        if (strcmp(p, "/var/run/docker.sock") == 0 ||
-            strcmp(p, "/run/docker.sock") == 0) {
-            print_alert(ev, meta, 4, "DOCKER-SOCKET-ESCAPE",
-                        "docker-socket-open",
-                        "Container process opened Docker socket");
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  ATTACK 2 — Privileged Container Escape
- *
- *  Triggers: mount() or setns() from a container process that has
- *  CAP_SYS_ADMIN, accessing host paths like /proc/1/root
- * ═════════════════════════════════════════════════════════════════ */
-static bool detect_privileged_escape(const struct event *ev,
-                                     const struct metadata *meta)
-{
-    const char *p = ev->path;
-
-    if (!meta->cap_sys_admin)
-        return false;
-
-    /* mount() from inside a container with CAP_SYS_ADMIN */
-    if (ev->event_type == EVT_MOUNT) {
-        /* Only alert on interesting mount types, not runc container setup */
-        if (strcmp(ev->comm, "runc") == 0 ||
-            strncmp(ev->comm, "runc:[", 6) == 0)
-            return false;
-
-        print_alert(ev, meta, 4, "PRIVILEGED-ESCAPE",
-                    "container-mount",
-                    "Privileged container invoked mount()");
-        return true;
-    }
-
-    /* setns() from inside a container — namespace migration */
-    if (ev->event_type == EVT_SETNS) {
-        if (strcmp(ev->comm, "runc") == 0 ||
-            strncmp(ev->comm, "runc:[", 6) == 0)
-            return false;
-
-        print_alert(ev, meta, 4, "PRIVILEGED-ESCAPE",
-                    "container-setns",
-                    "Privileged container invoked setns()");
-        return true;
-    }
-
-    /* openat /proc/1/root — reading host filesystem */
-    if (ev->event_type == EVT_OPENAT) {
-        if (strncmp(p, "/proc/1/root", 12) == 0) {
-            print_alert(ev, meta, 4, "PRIVILEGED-ESCAPE",
-                        "proc-root-access",
-                        "Container accessed host via /proc/1/root");
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  ATTACK 3 — Kernel Exploit / Cgroup Escape (CVE-2022-0492)
- *
- *  Triggers: mount("cgroup") and access to release_agent,
- *  notify_on_release from inside a container
- * ═════════════════════════════════════════════════════════════════ */
-static bool detect_cgroup_escape(const struct event *ev,
-                                 const struct metadata *meta)
-{
-    const char *p = ev->path;
-
-    /* mount() of cgroup filesystem — the first step of CVE-2022-0492 */
-    if (ev->event_type == EVT_MOUNT) {
-        if (strcmp(p, "cgroup") == 0 || strcmp(p, "cgroup2") == 0 ||
-            (ev->extra[0] && strcmp(ev->extra, "cgroup") == 0)) {
-            print_alert(ev, meta, 4, "CGROUP-ESCAPE",
-                        "cgroup-mount",
-                        "Container mounted cgroup filesystem (CVE-2022-0492)");
-            return true;
-        }
-    }
-
-    /* openat on release_agent or notify_on_release files */
-    if (ev->event_type == EVT_OPENAT) {
-        if (strstr(p, "release_agent") || strstr(p, "notify_on_release")) {
-            print_alert(ev, meta, 4, "CGROUP-ESCAPE",
-                        "cgroup-release-agent",
-                        "Container accessed cgroup release_agent/notify_on_release");
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  ATTACK 4 — Sensitive Host Filesystem Access
- *
- *  Triggers: openat() on specific high-value host files that have
- *  been bind-mounted into the container (e.g., /etc/shadow)
- * ═════════════════════════════════════════════════════════════════ */
-static const char *sensitive_host_prefixes[] = {
-    "/hostfs/etc/shadow", "/hostfs/etc/gshadow", "/hostfs/etc/sudoers",
-    "/hostfs/etc/passwd",
-    "/hostfs/root/.ssh",
-    "/hostfs/etc/docker", "/hostfs/root/.docker",
-    "/hostfs/var/lib/kubelet", "/hostfs/etc/kubernetes",
-    NULL,
+enum match_type {
+    MATCH_NONE = 0,
+    MATCH_EXACT,
+    MATCH_PREFIX,
+    MATCH_CONTAINS,
 };
 
-static bool detect_sensitive_fs_access(const struct event *ev,
-                                       const struct metadata *meta)
-{
-    const char *p = ev->path;
+struct rule {
+    char     name[64];
+    char     attack[64];
+    uint32_t event_type;
+    enum match_type path_match;
+    char     paths[MAX_PATHS_PER_RULE][PATH_LEN];
+    int      path_count;
+    bool     also_match_extra;
+    char     exclude_comm[MAX_EXCLUDES][TASK_COMM_LEN];
+    int      exclude_count;
+    uint32_t family;
+    bool     requires_cap;
+    int      severity;
+    char     message[256];
+};
 
-    if (ev->event_type != EVT_OPENAT)
+static struct rule policy_rules[MAX_RULES];
+static int         policy_rule_count = 0;
+
+/* ── Tiny YAML parser (handles our policy format only) ───────── */
+
+static int parse_severity(const char *s)
+{
+    if (strcasecmp(s, "CRITICAL") == 0) return 4;
+    if (strcasecmp(s, "HIGH") == 0)     return 3;
+    if (strcasecmp(s, "MEDIUM") == 0)   return 2;
+    if (strcasecmp(s, "LOW") == 0)      return 1;
+    return 0;
+}
+
+static uint32_t parse_event_type(const char *s)
+{
+    if (strcmp(s, "mount") == 0)   return EVT_MOUNT;
+    if (strcmp(s, "openat") == 0)  return EVT_OPENAT;
+    if (strcmp(s, "connect") == 0) return EVT_CONNECT;
+    if (strcmp(s, "setns") == 0)   return EVT_SETNS;
+    return 0;
+}
+
+static enum match_type parse_match(const char *s)
+{
+    if (strcmp(s, "exact") == 0)    return MATCH_EXACT;
+    if (strcmp(s, "prefix") == 0)   return MATCH_PREFIX;
+    if (strcmp(s, "contains") == 0) return MATCH_CONTAINS;
+    return MATCH_NONE;
+}
+
+static char *strip_leading(char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+static void strip_quotes(char *s)
+{
+    size_t len = strlen(s);
+    if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
+        memmove(s, s + 1, len - 2);
+        s[len - 2] = '\0';
+    }
+}
+
+static int load_policy(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char line[512];
+    struct rule *r = NULL;
+    enum { CTX_NONE, CTX_PATHS, CTX_EXCLUDES } list_ctx = CTX_NONE;
+
+    if (!f) {
+        fprintf(stderr, "failed to open policy: %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        trim_newline(line);
+        char *s = strip_leading(line);
+
+        if (s[0] == '\0' || s[0] == '#')
+            continue;
+
+        /* New rule */
+        if (strncmp(s, "- rule:", 7) == 0) {
+            if (policy_rule_count >= MAX_RULES) break;
+            r = &policy_rules[policy_rule_count++];
+            memset(r, 0, sizeof(*r));
+            char *val = strip_leading(s + 7);
+            strip_quotes(val);
+            snprintf(r->name, sizeof(r->name), "%s", val);
+            list_ctx = CTX_NONE;
+            continue;
+        }
+
+        if (!r) continue;
+
+        /* List items */
+        if (s[0] == '-' && s[1] == ' ' && list_ctx != CTX_NONE) {
+            char *val = strip_leading(s + 2);
+            strip_quotes(val);
+            if (list_ctx == CTX_PATHS && r->path_count < MAX_PATHS_PER_RULE) {
+                snprintf(r->paths[r->path_count++], PATH_LEN, "%s", val);
+            } else if (list_ctx == CTX_EXCLUDES && r->exclude_count < MAX_EXCLUDES) {
+                snprintf(r->exclude_comm[r->exclude_count++], TASK_COMM_LEN, "%s", val);
+            }
+            continue;
+        }
+
+        list_ctx = CTX_NONE;
+
+        /* Key: value pairs */
+        char *colon = strchr(s, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        char *key = s;
+        char *val = strip_leading(colon + 1);
+        strip_quotes(val);
+
+        if (strcmp(key, "attack") == 0)
+            snprintf(r->attack, sizeof(r->attack), "%s", val);
+        else if (strcmp(key, "event") == 0)
+            r->event_type = parse_event_type(val);
+        else if (strcmp(key, "match") == 0)
+            r->path_match = parse_match(val);
+        else if (strcmp(key, "family") == 0)
+            r->family = (uint32_t)atoi(val);
+        else if (strcmp(key, "requires_cap_sys_admin") == 0)
+            r->requires_cap = (strcmp(val, "true") == 0);
+        else if (strcmp(key, "also_match_extra") == 0)
+            r->also_match_extra = (strcmp(val, "true") == 0);
+        else if (strcmp(key, "severity") == 0)
+            r->severity = parse_severity(val);
+        else if (strcmp(key, "message") == 0)
+            snprintf(r->message, sizeof(r->message), "%s", val);
+        else if (strcmp(key, "paths") == 0)
+            list_ctx = CTX_PATHS;
+        else if (strcmp(key, "exclude_comm") == 0)
+            list_ctx = CTX_EXCLUDES;
+    }
+
+    fclose(f);
+    fprintf(stderr, "  Policy: %d rules from %s\n", policy_rule_count, path);
+    return 0;
+}
+
+/* ── Rule evaluation ─────────────────────────────────────────── */
+
+static bool match_path_list(const char *value, const struct rule *r)
+{
+    for (int i = 0; i < r->path_count; i++) {
+        switch (r->path_match) {
+        case MATCH_EXACT:
+            if (strcmp(value, r->paths[i]) == 0) return true;
+            break;
+        case MATCH_PREFIX:
+            if (strncmp(value, r->paths[i], strlen(r->paths[i])) == 0) return true;
+            break;
+        case MATCH_CONTAINS:
+            if (strstr(value, r->paths[i])) return true;
+            break;
+        case MATCH_NONE:
+            break;
+        }
+    }
+    return false;
+}
+
+static bool evaluate_rule(const struct rule *r, const struct event *ev,
+                          const struct metadata *meta)
+{
+    if (r->event_type != ev->event_type)
         return false;
 
-    /* Check /hostfs/ paths — container reading mounted host filesystem */
-    for (int i = 0; sensitive_host_prefixes[i]; i++) {
-        if (strncmp(p, sensitive_host_prefixes[i],
-                    strlen(sensitive_host_prefixes[i])) == 0) {
-            print_alert(ev, meta, 3, "SENSITIVE-FS-ACCESS",
-                        "hostfs-credential-read",
-                        "Container read host credential via bind mount");
-            return true;
-        }
-    }
+    if (r->family != 0 && r->family != ev->family)
+        return false;
 
-    /* /proc/1/environ — reading host init environment */
-    if (strcmp(p, "/proc/1/environ") == 0) {
-        print_alert(ev, meta, 3, "SENSITIVE-FS-ACCESS",
-                    "host-environ-read",
-                    "Container read host PID 1 environment variables");
-        return true;
-    }
+    if (r->requires_cap && !meta->cap_sys_admin)
+        return false;
 
-    /* /proc/<pid>/cmdline enumeration from container */
-    if (strncmp(p, "/proc/", 6) == 0 && strstr(p, "/cmdline")) {
-        /* Only alert once per batch — just on PID 1 */
-        if (strncmp(p, "/proc/1/cmdline", 15) == 0) {
-            print_alert(ev, meta, 2, "SENSITIVE-FS-ACCESS",
-                        "host-process-enum",
-                        "Container enumerating host process command lines");
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/* ══════════════════════════════════════════════════════════════════
- *  ATTACK 5 — Namespace Escape
- *
- *  Triggers: setns() from container + openat on /proc/1/ns/
- *  to join host namespaces
- * ═════════════════════════════════════════════════════════════════ */
-static bool detect_namespace_escape(const struct event *ev,
-                                    const struct metadata *meta)
-{
-    const char *p = ev->path;
-
-    /* setns() from nsenter or similar — skip runc (container setup) */
-    if (ev->event_type == EVT_SETNS) {
-        if (strcmp(ev->comm, "runc") == 0 ||
-            strncmp(ev->comm, "runc:[", 6) == 0 ||
-            strcmp(ev->comm, "containerd-shi") == 0)
+    for (int i = 0; i < r->exclude_count; i++) {
+        if (strncmp(ev->comm, r->exclude_comm[i],
+                    strlen(r->exclude_comm[i])) == 0)
             return false;
-
-        /* nsenter or bash doing setns = real attack */
-        print_alert(ev, meta, 4, "NAMESPACE-ESCAPE",
-                    "namespace-setns",
-                    "Container process called setns() to join host namespace");
-        return true;
     }
 
-    /* openat /proc/1/ns/ — probing host namespace files */
-    if (ev->event_type == EVT_OPENAT) {
-        if (strncmp(p, "/proc/1/ns/", 11) == 0 ||
-            strncmp(p, "/proc/self/ns/", 14) == 0) {
-            print_alert(ev, meta, 3, "NAMESPACE-ESCAPE",
-                        "namespace-probe",
-                        "Container opened host namespace file");
-            return true;
-        }
+    if (r->path_count > 0) {
+        bool matched = match_path_list(ev->path, r);
+        if (!matched && r->also_match_extra && ev->extra[0])
+            matched = match_path_list(ev->extra, r);
+        if (!matched)
+            return false;
     }
 
-    return false;
+    return true;
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  Main event evaluator — runs all 5 attack detectors
+ *  Main event evaluator — runs policy rules in order
  * ═════════════════════════════════════════════════════════════════ */
 static void evaluate_event(const struct event *ev)
 {
@@ -497,19 +491,11 @@ static void evaluate_event(const struct event *ev)
 
     if (!p) p = "";
 
-    /* ── Step 1: Quick mntns check from BPF data (no /proc needed) ──
-     * If the event's mntns differs from the host, it's a container.
-     * This avoids the race where short-lived processes exit before
-     * we can read /proc/<pid>/cgroup.
-     */
     bool is_container_by_mntns = (host_mntns != 0 && ev->mntns != 0 &&
                                    ev->mntns != host_mntns);
 
-    /* ── Step 2: Enrich with container metadata ── */
     meta = enrich_metadata(ev->tgid, ev);
 
-    /* If /proc-based detection failed but BPF mntns says container,
-     * trust the BPF data (it was captured at syscall time). */
     if (!meta.containerized && is_container_by_mntns) {
         meta.containerized = true;
         if (meta.container_id[0] == '\0')
@@ -518,24 +504,22 @@ static void evaluate_event(const struct event *ev)
             snprintf(meta.runtime, sizeof(meta.runtime), "docker");
     }
 
-    /* ── Step 3: STRICT container check ── */
     if (!meta.containerized)
         return;
-
     if (meta.container_id[0] == '\0')
         return;
-
     if (is_noise_comm(ev->comm))
         return;
 
-    /* ── Step 4: Run attack detectors (exclusive — first match wins) ──
-     * Order matters: specific detectors run before general ones so
-     * cgroup/namespace attacks aren't swallowed by privileged-escape. */
-    if (detect_docker_socket_escape(ev, &meta)) return;
-    if (detect_cgroup_escape(ev, &meta))         return;
-    if (detect_namespace_escape(ev, &meta))      return;
-    if (detect_privileged_escape(ev, &meta))     return;
-    detect_sensitive_fs_access(ev, &meta);
+    /* Evaluate rules in order — first match wins */
+    for (int i = 0; i < policy_rule_count; i++) {
+        if (evaluate_rule(&policy_rules[i], ev, &meta)) {
+            print_alert(ev, &meta, policy_rules[i].severity,
+                       policy_rules[i].attack, policy_rules[i].name,
+                       policy_rules[i].message);
+            return;
+        }
+    }
 }
 
 /* ── Ring buffer callback ──────────────────────────────────────── */
@@ -584,6 +568,7 @@ static struct bpf_link *attach_tp(struct bpf_object *obj,
 int main(int argc, char **argv)
 {
     const char *bpf_obj_path = "internal/bpf/escape_detector.bpf.o";
+    const char *policy_path = "examples/policy.yaml";
     struct bpf_object *obj = NULL;
     struct bpf_link *links[4] = {0};
     struct ring_buffer *rb = NULL;
@@ -594,6 +579,8 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-bpf-object") == 0 && i + 1 < argc) {
             bpf_obj_path = argv[++i];
+        } else if (strcmp(argv[i], "-policy") == 0 && i + 1 < argc) {
+            policy_path = argv[++i];
         } else if (strcmp(argv[i], "-json") == 0) {
             json_output = true;
         }
@@ -603,6 +590,11 @@ int main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
     host_mntns = get_host_mntns();
     self_tgid = (uint32_t)getpid();
+
+    if (load_policy(policy_path) != 0 || policy_rule_count == 0) {
+        fprintf(stderr, "no rules loaded — aborting\n");
+        return 1;
+    }
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -670,7 +662,7 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "eBPF detector started — monitoring for container escape attacks...\n");
     fprintf(stderr, "  Tracepoints: sys_enter_mount, sys_enter_setns, sys_enter_openat, sys_enter_connect\n");
-    fprintf(stderr, "  Attacks: docker-socket | privileged-escape | cgroup-escape | sensitive-fs | namespace-escape\n");
+    fprintf(stderr, "  Rules: %d loaded from %s\n", policy_rule_count, policy_path);
     fprintf(stderr, "  Filtering: container-only (host noise suppressed)\n\n");
 
     while (!stop) {

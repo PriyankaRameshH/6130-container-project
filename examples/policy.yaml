@@ -1,11 +1,154 @@
-sensitiveHostPaths:
-  - /proc
-  - /sys
-  - /dev
-  - /etc
-  - /root
-  - /var/lib/kubelet
+# eBPF Container Escape Detector — Policy Rules
+#
+# Rules are evaluated in order. First match wins (exclusive detection).
+# Place specific rules before general ones to prevent false categorization.
+#
+# Fields:
+#   rule:                   Rule identifier (appears in alert output)
+#   attack:                 Attack category name
+#   event:                  Syscall: mount | openat | connect | setns
+#   match:                  Path matching: exact | prefix | contains
+#   paths:                  Paths to check against the syscall path argument
+#   also_match_extra:       Also check paths against mount target field
+#   family:                 Socket address family (1 = AF_UNIX)
+#   requires_cap_sys_admin: Only match if process has CAP_SYS_ADMIN
+#   exclude_comm:           Skip if process name starts with any entry
+#   severity:               CRITICAL | HIGH | MEDIUM | LOW
+#   message:                Human-readable alert text
 
-dockerSocketPaths:
-  - /var/run/docker.sock
-  - /run/docker.sock
+rules:
+  # ── Attack 1: Docker Socket Escape ──────────────────────────
+
+  - rule: docker-socket-connect
+    attack: DOCKER-SOCKET-ESCAPE
+    event: connect
+    family: 1
+    match: exact
+    paths:
+      - /var/run/docker.sock
+      - /run/docker.sock
+    severity: CRITICAL
+    message: Container process connected to Docker socket
+
+  - rule: docker-socket-open
+    attack: DOCKER-SOCKET-ESCAPE
+    event: openat
+    match: exact
+    paths:
+      - /var/run/docker.sock
+      - /run/docker.sock
+    severity: CRITICAL
+    message: Container process opened Docker socket
+
+  # ── Attack 3: Cgroup Escape (before privileged — more specific) ─
+
+  - rule: cgroup-mount
+    attack: CGROUP-ESCAPE
+    event: mount
+    match: exact
+    paths:
+      - cgroup
+      - cgroup2
+    also_match_extra: true
+    severity: CRITICAL
+    message: Container mounted cgroup filesystem (CVE-2022-0492)
+
+  - rule: cgroup-release-agent
+    attack: CGROUP-ESCAPE
+    event: openat
+    match: contains
+    paths:
+      - release_agent
+      - notify_on_release
+    severity: CRITICAL
+    message: Container accessed cgroup release_agent/notify_on_release
+
+  # ── Attack 5: Namespace Escape (before privileged — more specific) ─
+
+  - rule: namespace-setns
+    attack: NAMESPACE-ESCAPE
+    event: setns
+    exclude_comm:
+      - runc
+      - "runc:["
+      - containerd-shi
+    severity: CRITICAL
+    message: Container process called setns() to join host namespace
+
+  - rule: namespace-probe
+    attack: NAMESPACE-ESCAPE
+    event: openat
+    match: prefix
+    paths:
+      - /proc/1/ns/
+      - /proc/self/ns/
+    severity: HIGH
+    message: Container opened host namespace file
+
+  # ── Attack 2: Privileged Escape (catch-all after specific) ──
+
+  - rule: container-mount
+    attack: PRIVILEGED-ESCAPE
+    event: mount
+    requires_cap_sys_admin: true
+    exclude_comm:
+      - runc
+      - "runc:["
+    severity: CRITICAL
+    message: Privileged container invoked mount()
+
+  - rule: container-setns
+    attack: PRIVILEGED-ESCAPE
+    event: setns
+    requires_cap_sys_admin: true
+    exclude_comm:
+      - runc
+      - "runc:["
+    severity: CRITICAL
+    message: Privileged container invoked setns()
+
+  - rule: proc-root-access
+    attack: PRIVILEGED-ESCAPE
+    event: openat
+    match: prefix
+    paths:
+      - /proc/1/root
+    severity: CRITICAL
+    message: Container accessed host via /proc/1/root
+
+  # ── Attack 4: Sensitive FS Access ───────────────────────────
+
+  - rule: hostfs-credential-read
+    attack: SENSITIVE-FS-ACCESS
+    event: openat
+    match: prefix
+    paths:
+      - /hostfs/etc/shadow
+      - /hostfs/etc/gshadow
+      - /hostfs/etc/sudoers
+      - /hostfs/etc/passwd
+      - /hostfs/root/.ssh
+      - /hostfs/etc/docker
+      - /hostfs/root/.docker
+      - /hostfs/var/lib/kubelet
+      - /hostfs/etc/kubernetes
+    severity: HIGH
+    message: Container read host credential via bind mount
+
+  - rule: host-environ-read
+    attack: SENSITIVE-FS-ACCESS
+    event: openat
+    match: exact
+    paths:
+      - /proc/1/environ
+    severity: HIGH
+    message: Container read host PID 1 environment variables
+
+  - rule: host-process-enum
+    attack: SENSITIVE-FS-ACCESS
+    event: openat
+    match: exact
+    paths:
+      - /proc/1/cmdline
+    severity: MEDIUM
+    message: Container enumerating host process command lines
