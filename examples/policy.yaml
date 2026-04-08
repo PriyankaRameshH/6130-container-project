@@ -29,7 +29,7 @@ rules:
       - /var/run/docker.sock
       - /run/docker.sock
     severity: CRITICAL
-    response: kill-process
+    response: kill-container
     message: Container process connected to Docker socket
 
   - rule: docker-socket-open
@@ -40,7 +40,7 @@ rules:
       - /var/run/docker.sock
       - /run/docker.sock
     severity: CRITICAL
-    response: kill-process
+    response: kill-container
     message: Container process opened Docker socket
 
   # ── Attack 3: Cgroup Escape (before privileged — more specific) ─
