@@ -81,6 +81,14 @@ static struct id_cache_entry *cache_lookup(uint32_t mntns)
 
 static void cache_store(uint32_t mntns, const char *cid, const char *runtime)
 {
+    /* Update existing entry if mntns already cached (handles inode reuse) */
+    for (int i = 0; i < id_cache_count; i++) {
+        if (id_cache[i].mntns == mntns) {
+            snprintf(id_cache[i].container_id, sizeof(id_cache[i].container_id), "%s", cid);
+            snprintf(id_cache[i].runtime, sizeof(id_cache[i].runtime), "%s", runtime);
+            return;
+        }
+    }
     if (id_cache_count >= ID_CACHE_SIZE) return;
     struct id_cache_entry *e = &id_cache[id_cache_count++];
     e->mntns = mntns;
@@ -297,6 +305,11 @@ static struct metadata enrich_metadata(uint32_t pid, const struct event *ev)
     /* 1. Try direct cgroup read for this PID */
     bool got_id = try_read_cgroup(pid, &meta);
 
+    /* 1b. Fresh cgroup data is ground truth — always update cache */
+    if (got_id && ev->mntns != 0 && ev->mntns != host_mntns) {
+        cache_store(ev->mntns, meta.container_id, meta.runtime);
+    }
+
     /* 2. /proc mntns fallback — process may be dead before cgroup was read */
     if (!meta.containerized) {
         meta.containerized = is_containerized_by_mntns(pid);
@@ -334,7 +347,7 @@ static struct metadata enrich_metadata(uint32_t pid, const struct event *ev)
     }
 
     /* 6. Cache the result for future events from this container */
-    if (got_id && ev->mntns != 0 && !cache_lookup(ev->mntns)) {
+    if (got_id && ev->mntns != 0 && ev->mntns != host_mntns) {
         cache_store(ev->mntns, meta.container_id, meta.runtime);
     }
 
